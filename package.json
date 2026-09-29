@@ -1,0 +1,40 @@
+{
+  "name": "opencode-plugin-ntfy-sh",
+  "version": "0.1.0",
+  "description": "opencode plugin: expose the server via a Cloudflare tunnel and send ntfy.sh notifications with deep links when a session needs input or finishes",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mieweb/opencode-plugin-ntfy-sh.git"
+  },
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "ntfy",
+    "cloudflare",
+    "cloudflared",
+    "tunnel"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "latest",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "cloudflared": "^0.7.3"
+  }
+}
