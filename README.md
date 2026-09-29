@@ -31,7 +31,7 @@ The tunnel puts your opencode server on the public internet. That server can run
 
 ## Installation
 
-Clone the repo, run `npm install`, and reference it by path in `~/.config/opencode/opencode.jsonc`:
+Clone the repo, run `npm install`, and reference `src/index.ts` by path in `~/.config/opencode/opencode.jsonc`:
 
 ```jsonc
 {
@@ -91,6 +91,27 @@ Example `~/.config/opencode/remote-notify.json`:
 - **Click / action button:** `<publicUrl>/<base64url(directory)>/session/<sessionID>`, which opens the session in the web UI
 
 Notifications for the same session and event within 5 seconds are de-duplicated.
+
+## Restarting the tunnel without restarting opencode
+
+Send `SIGUSR1` to the opencode server:
+
+```sh
+kill -USR1 "$(pgrep -f 'opencode serve')"
+```
+
+The plugin will:
+1. stop the current tunnel;
+2. reload `src/core.ts`, so code changes take effect;
+3. re-read `remote-notify.json`;
+4. start a new tunnel and send a new "opencode server online" notification.
+
+Sessions and running agents are not affected.
+
+> [!WARNING]
+> Only send `SIGUSR1` to a server that started **with this version of the plugin loaded**. A process with no `SIGUSR1` handler is terminated by the signal. To check, run `grep SigCgt /proc/<pid>/status`; bit 9 (`0x200`) must be set.
+
+`src/index.ts` is a thin wrapper that hands opencode stable hook functions and forwards them to the currently loaded `src/core.ts`. Changes to `src/index.ts` itself still need a full restart.
 
 ## Development
 
