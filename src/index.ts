@@ -176,6 +176,10 @@ const RemoteNotify: Plugin = async ({ client, serverUrl, directory }, passed) =>
 
   const local = new URL(serverUrl.toString())
   const hasRealPort = /^https?:$/.test(local.protocol) && local.port !== "" && local.port !== "0"
+  const ntfy = new URL(opts.ntfyUrl)
+  const topic = ntfy.pathname.replace(/^\//, "")
+  const ntfyBase = ntfy.origin
+
   let tunnelUrl: Promise<string | undefined>
   if (!hasRealPort && !opts.tunnel?.publicUrl) {
     log("warn", `server is not listening on a real port (${local}). Start opencode with --port <n> (or use \`opencode serve\`/\`opencode web\`) for tunneling.`)
@@ -183,37 +187,47 @@ const RemoteNotify: Plugin = async ({ client, serverUrl, directory }, passed) =>
   } else {
     // Connect via loopback even if the server binds 0.0.0.0
     const target = `${local.protocol}//127.0.0.1:${local.port}`
-    tunnelUrl = startTunnel(opts, target)
-  }
-
-  const ntfy = new URL(opts.ntfyUrl)
-  const topic = ntfy.pathname.replace(/^\//, "")
-  const ntfyBase = ntfy.origin
-
-  tunnelUrl.then(async (u) => {
-    if (!u) return log("warn", "no public URL available; notifications will not include links")
-    log("info", "public URL:", u)
-    try {
-      await fetch(ntfyBase, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(opts.ntfyToken ? { Authorization: `Bearer ${opts.ntfyToken}` } : {}),
-        },
-        body: JSON.stringify({
-          topic,
-          title: "opencode server online",
-          message: `${u}\nProject: ${directory}`,
-          tags: ["rocket"],
-          priority: 2,
-          click: u,
-          actions: [{ action: "view", label: "Open", url: u }],
-        }),
+    // opencode creates one plugin instance per project directory, all in the
+    // same process. Share one tunnel per server so each new directory doesn't
+    // start another cloudflared (with a new URL). Kept on globalThis in case
+    // the module is imported more than once.
+    const g = globalThis as { __ntfyShTunnels?: Map<string, Promise<string | undefined>> }
+    const tunnels = (g.__ntfyShTunnels ??= new Map())
+    const existing = tunnels.get(target)
+    if (existing) {
+      tunnelUrl = existing
+    } else {
+      tunnelUrl = startTunnel(opts, target)
+      tunnels.set(target, tunnelUrl)
+      tunnelUrl.then(async (u) => {
+        if (!u) {
+          tunnels.delete(target) // allow a retry from the next instance
+          return log("warn", "no public URL available; notifications will not include links")
+        }
+        log("info", "public URL:", u)
+        try {
+          await fetch(ntfyBase, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              ...(opts.ntfyToken ? { Authorization: `Bearer ${opts.ntfyToken}` } : {}),
+            },
+            body: JSON.stringify({
+              topic,
+              title: "opencode server online",
+              message: u,
+              tags: ["rocket"],
+              priority: 2,
+              click: u,
+              actions: [{ action: "view", label: "Open", url: u }],
+            }),
+          })
+        } catch (e) {
+          log("error", "ntfy startup notification failed:", e)
+        }
       })
-    } catch (e) {
-      log("error", "ntfy startup notification failed:", e)
     }
-  })
+  }
 
   const sessionCache = new Map<string, { title: string; directory: string; parentID?: string }>()
   const lastSent = new Map<string, number>()
