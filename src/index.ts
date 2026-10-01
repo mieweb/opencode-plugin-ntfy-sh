@@ -17,11 +17,12 @@
  * Only hooks listed in DELEGATED are forwarded. If core.ts starts using
  * another hook, add it here; changes to this file itself still need a restart.
  */
-import type { Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin"
+import { tool, type Hooks, type Plugin, type PluginInput, type PluginOptions } from "@opencode-ai/plugin"
 
 type Core = {
   default: Plugin
   shutdown?: () => void | Promise<void>
+  restartTunnels?: (reason?: string) => number
   log?: (level: "debug" | "info" | "warn" | "error", ...parts: unknown[]) => void
 }
 type Instance = { input: PluginInput; options?: PluginOptions; hooks: Hooks }
@@ -94,6 +95,19 @@ const NtfySh: Plugin = async (input, options) => {
   const hooks: Hooks = {}
   for (const name of DELEGATED) {
     ;(hooks as any)[name] = (...args: unknown[]) => (inst.hooks as any)[name]?.(...args)
+  }
+  // Defined here (not in core.ts) so the tool survives hot reloads.
+  hooks.tool = {
+    tunnel_restart: tool({
+      description:
+        "Restart the opencode-plugin-ntfy-sh Cloudflare tunnel (e.g. after a network change). Quick-tunnel URLs change on restart; a notification with the new URL is sent.",
+      args: {},
+      async execute() {
+        const core = await state.core
+        const n = core?.restartTunnels?.("requested via tunnel_restart tool") ?? 0
+        return n ? `Restarting ${n} tunnel(s); a notification with the URL will follow.` : "No tunnel is running."
+      },
+    }),
   }
   return hooks
 }

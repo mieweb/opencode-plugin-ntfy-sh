@@ -29,7 +29,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { Tunnel, bin, install, use } from "cloudflared"
 import { readFileSync, existsSync } from "node:fs"
-import { homedir } from "node:os"
+import { homedir, networkInterfaces } from "node:os"
 import { join } from "node:path"
 
 type Kind = "idle" | "question" | "permission" | "error"
@@ -108,9 +108,212 @@ async function ensureBinary(override?: string): Promise<string> {
   return bin
 }
 
-/** Tunnels started by this copy of the module, keyed by local target URL. */
-const tunnels = new Map<string, Promise<string | undefined>>()
-const stoppers = new Set<() => void>()
+type Notify = (title: string, url: string) => Promise<void>
+
+/**
+ * Keeps one cloudflared running for a local target and restarts it when:
+ *  - cloudflared exits or fails to come up (exponential backoff, 2s..60s);
+ *  - the machine's network interfaces/addresses change (e.g. new Wi-Fi);
+ *  - the process was suspended (laptop sleep: timer gap far over interval);
+ *  - the public URL fails a health check 3 times in a row.
+ * Quick-tunnel URLs change on every restart, so links always read `url()`.
+ */
+class TunnelManager {
+  private tunnel?: Tunnel
+  private current?: string
+  private waiters: Array<(u: string | undefined) => void> = []
+  private starting = false
+  private stopped = false
+  private backoff = 2_000
+  private retryTimer?: ReturnType<typeof setTimeout>
+  private watchTimer?: ReturnType<typeof setInterval>
+  private failures = 0
+  private lastTick = Date.now()
+  private netSig = networkSignature()
+  private generation = 0
+
+  constructor(
+    private t: NonNullable<Options["tunnel"]>,
+    private localUrl: string,
+    private notify: Notify,
+  ) {}
+
+  /** Current public URL; waits (up to 20s) while a (re)start is in flight. */
+  url(): Promise<string | undefined> {
+    if (this.current || this.stopped) return Promise.resolve(this.current)
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(this.current), 20_000)
+      this.waiters.push((u) => {
+        clearTimeout(timer)
+        resolve(u)
+      })
+    })
+  }
+
+  start() {
+    this.spawn()
+    this.watchTimer = setInterval(() => void this.watch(), WATCH_INTERVAL)
+    // Don't keep the process alive just for the watchdog.
+    ;(this.watchTimer as any).unref?.()
+  }
+
+  stop() {
+    this.stopped = true
+    clearTimeout(this.retryTimer)
+    clearInterval(this.watchTimer)
+    this.kill()
+    for (const w of this.waiters.splice(0)) w(undefined)
+  }
+
+  restart(reason: string) {
+    if (this.stopped) return
+    log("warn", `restarting tunnel: ${reason}`)
+    clearTimeout(this.retryTimer)
+    this.kill()
+    this.spawn()
+  }
+
+  private kill() {
+    this.generation++ // ignore events from the old process
+    this.current = undefined
+    this.starting = false
+    try {
+      this.tunnel?.stop()
+    } catch {}
+    this.tunnel = undefined
+  }
+
+  private scheduleRetry(reason: string) {
+    if (this.stopped || this.retryTimer) return
+    const delay = this.backoff
+    this.backoff = Math.min(this.backoff * 2, 60_000)
+    log("warn", `${reason}; retrying tunnel in ${delay / 1000}s`)
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = undefined
+      this.kill()
+      this.spawn()
+    }, delay)
+  }
+
+  private async spawn() {
+    if (this.stopped || this.starting) return
+    this.starting = true
+    const gen = ++this.generation
+    const named = !!this.t.token
+    const namedUrl = this.t.hostname ? `https://${this.t.hostname.replace(/^https?:\/\//, "")}` : undefined
+
+    let tunnel: Tunnel
+    try {
+      await ensureBinary(this.t.binary)
+      if (gen !== this.generation) return
+      tunnel = named
+        ? Tunnel.withToken(this.t.token!, { "--no-autoupdate": true })
+        : Tunnel.quick(this.localUrl, { "--no-autoupdate": true })
+    } catch (e) {
+      this.starting = false
+      return this.scheduleRetry(`failed to start cloudflared: ${(e as Error).message}`)
+    }
+    this.tunnel = tunnel
+
+    const up = (u: string | undefined) => {
+      if (gen !== this.generation) return
+      clearTimeout(upTimer)
+      this.starting = false
+      if (!u) return this.scheduleRetry("tunnel came up without a public URL")
+      const changed = u !== this.current
+      this.current = u
+      this.backoff = 2_000
+      this.failures = 0
+      for (const w of this.waiters.splice(0)) w(u)
+      if (changed) {
+        log("info", "public URL:", u)
+        void this.notify(this.everUp ? "opencode tunnel reconnected" : "opencode server online", u)
+      }
+      this.everUp = true
+    }
+    const upTimer = setTimeout(() => {
+      if (gen === this.generation && this.starting) this.restart("tunnel did not come up within 60s")
+    }, 60_000)
+
+    // Quick tunnel: library parses the trycloudflare URL for us.
+    tunnel.once("url", (u) => {
+      if (!named) up(u)
+    })
+    // Named tunnel: routing lives in the Cloudflare dashboard; only the
+    // hostname is needed.
+    tunnel.once("connected", () => {
+      if (named) up(namedUrl)
+    })
+    tunnel.on("error", (e) => {
+      if (gen !== this.generation) return
+      log("error", "cloudflared error:", e.message)
+    })
+    tunnel.on("exit", (code) => {
+      if (gen !== this.generation) return
+      clearTimeout(upTimer)
+      this.current = undefined
+      this.starting = false
+      this.tunnel = undefined
+      this.scheduleRetry(`cloudflared exited (${code})`)
+    })
+  }
+  private everUp = false
+
+  private async watch() {
+    if (this.stopped) return
+    const now = Date.now()
+    const gap = now - this.lastTick
+    this.lastTick = now
+    if (gap > WATCH_INTERVAL * 3) return this.restart(`process was suspended for ${Math.round(gap / 1000)}s (sleep?)`)
+
+    const sig = networkSignature()
+    if (sig !== this.netSig) {
+      this.netSig = sig
+      // Give DHCP/DNS a moment to settle on the new network.
+      clearTimeout(this.retryTimer)
+      this.retryTimer = setTimeout(() => {
+        this.retryTimer = undefined
+        this.backoff = 2_000
+        this.restart("network changed")
+      }, 3_000)
+      return
+    }
+
+    if (!this.current || this.starting || this.t.publicUrl) return
+    if (await healthy(this.current)) {
+      this.failures = 0
+    } else if (++this.failures >= 3) {
+      this.restart(`public URL failed ${this.failures} health checks`)
+    }
+  }
+}
+
+const WATCH_INTERVAL = 20_000
+
+/** Non-internal interface addresses; changes when switching networks. */
+function networkSignature() {
+  return Object.entries(networkInterfaces())
+    .flatMap(([name, addrs]) => (addrs ?? []).filter((a) => !a.internal).map((a) => `${name}=${a.address}`))
+    .sort()
+    .join(",")
+}
+
+/**
+ * Any response from our origin counts (401 from OPENCODE_SERVER_PASSWORD
+ * included). Cloudflare answers 530 (error 1033) when the tunnel is gone;
+ * network errors/timeouts also count as unhealthy.
+ */
+async function healthy(url: string) {
+  try {
+    const res = await fetch(`${url}/global/health`, { signal: AbortSignal.timeout(10_000), redirect: "manual" })
+    return res.status !== 530
+  } catch {
+    return false
+  }
+}
+
+/** Tunnel managers started by this copy of the module, keyed by local target. */
+const managers = new Map<string, TunnelManager>()
 let exitHooked = false
 
 /**
@@ -118,70 +321,14 @@ let exitHooked = false
  * before it loads a fresh copy of this module on SIGUSR1.
  */
 export function shutdown() {
-  for (const stop of stoppers) stop()
-  stoppers.clear()
-  tunnels.clear()
+  for (const m of managers.values()) m.stop()
+  managers.clear()
 }
 
-function startTunnel(opts: Options, localUrl: string): Promise<string | undefined> {
-  const t = opts.tunnel!
-  if (t.publicUrl) return Promise.resolve(t.publicUrl.replace(/\/$/, ""))
-  if (!t.enabled) return Promise.resolve(undefined)
-
-  const named = !!t.token
-  const namedUrl = t.hostname ? `https://${t.hostname.replace(/^https?:\/\//, "")}` : undefined
-
-  return new Promise<string | undefined>(async (resolve) => {
-    let settled = false
-    const done = (v: string | undefined) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolve(v)
-    }
-    const timer = setTimeout(() => done(named ? namedUrl : undefined), 60_000)
-
-    let tunnel: Tunnel
-    try {
-      await ensureBinary(t.binary)
-      tunnel = named
-        ? Tunnel.withToken(t.token!, { "--no-autoupdate": true })
-        : Tunnel.quick(localUrl, { "--no-autoupdate": true })
-    } catch (e) {
-      log("error", "failed to start cloudflared:", e)
-      return done(undefined)
-    }
-
-    // Quick tunnel: library parses the trycloudflare URL for us.
-    tunnel.once("url", (u) => {
-      if (!named) done(u)
-    })
-    // Named tunnel: routing is configured in the Cloudflare dashboard; we only
-    // need to know the public hostname.
-    tunnel.once("connected", () => {
-      if (named) done(namedUrl)
-    })
-    tunnel.on("error", (e) => {
-      log("error", "cloudflared error:", e.message)
-      done(undefined)
-    })
-    tunnel.on("exit", (code) => {
-      log("warn", "cloudflared exited", code)
-      done(undefined)
-    })
-
-    stoppers.add(() => {
-      try {
-        tunnel.stop()
-      } catch {}
-    })
-    if (!exitHooked) {
-      exitHooked = true
-      process.once("exit", shutdown)
-      process.once("SIGINT", shutdown)
-      process.once("SIGTERM", shutdown)
-    }
-  })
+/** Force-restart all tunnels (used by the `tunnel_restart` tool). */
+export function restartTunnels(reason = "manual restart") {
+  for (const m of managers.values()) m.restart(reason)
+  return managers.size
 }
 
 const RemoteNotify: Plugin = async ({ client, serverUrl, directory }, passed) => {
@@ -200,50 +347,58 @@ const RemoteNotify: Plugin = async ({ client, serverUrl, directory }, passed) =>
   const topic = ntfy.pathname.replace(/^\//, "")
   const ntfyBase = ntfy.origin
 
-  let tunnelUrl: Promise<string | undefined>
-  if (!hasRealPort && !opts.tunnel?.publicUrl) {
+  const notifyOnline: Notify = async (title, u) => {
+    try {
+      await fetch(ntfyBase, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(opts.ntfyToken ? { Authorization: `Bearer ${opts.ntfyToken}` } : {}),
+        },
+        body: JSON.stringify({
+          topic,
+          title,
+          message: u,
+          tags: ["rocket"],
+          priority: 2,
+          click: u,
+          actions: [{ action: "view", label: "Open", url: u }],
+        }),
+      })
+    } catch (e) {
+      log("error", "ntfy online notification failed:", e)
+    }
+  }
+
+  let tunnelUrl: () => Promise<string | undefined>
+  const t = opts.tunnel!
+  if (t.publicUrl) {
+    const fixed = t.publicUrl.replace(/\/$/, "")
+    tunnelUrl = async () => fixed
+  } else if (!t.enabled) {
+    tunnelUrl = async () => undefined
+  } else if (!hasRealPort) {
     log("warn", `server is not listening on a real port (${local}). Start opencode with --port <n> (or use \`opencode serve\`/\`opencode web\`) for tunneling.`)
-    tunnelUrl = Promise.resolve(undefined)
+    tunnelUrl = async () => undefined
   } else {
     // Connect via loopback even if the server binds 0.0.0.0
     const target = `${local.protocol}//127.0.0.1:${local.port}`
     // opencode creates one plugin instance per project directory, all in the
-    // same process. Share one tunnel per server so each new directory doesn't
-    // start another cloudflared (with a new URL).
-    const existing = tunnels.get(target)
-    if (existing) {
-      tunnelUrl = existing
-    } else {
-      tunnelUrl = startTunnel(opts, target)
-      tunnels.set(target, tunnelUrl)
-      tunnelUrl.then(async (u) => {
-        if (!u) {
-          tunnels.delete(target) // allow a retry from the next instance
-          return log("warn", "no public URL available; notifications will not include links")
-        }
-        log("info", "public URL:", u)
-        try {
-          await fetch(ntfyBase, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              ...(opts.ntfyToken ? { Authorization: `Bearer ${opts.ntfyToken}` } : {}),
-            },
-            body: JSON.stringify({
-              topic,
-              title: "opencode server online",
-              message: u,
-              tags: ["rocket"],
-              priority: 2,
-              click: u,
-              actions: [{ action: "view", label: "Open", url: u }],
-            }),
-          })
-        } catch (e) {
-          log("error", "ntfy startup notification failed:", e)
-        }
-      })
+    // same process. Share one tunnel per server.
+    let m = managers.get(target)
+    if (!m) {
+      m = new TunnelManager(t, target, notifyOnline)
+      managers.set(target, m)
+      m.start()
+      if (!exitHooked) {
+        exitHooked = true
+        process.once("exit", shutdown)
+        process.once("SIGINT", shutdown)
+        process.once("SIGTERM", shutdown)
+      }
     }
+    const mgr = m
+    tunnelUrl = () => mgr.url()
   }
 
   const sessionCache = new Map<string, { title: string; directory: string; parentID?: string }>()
@@ -290,7 +445,7 @@ const RemoteNotify: Plugin = async ({ client, serverUrl, directory }, passed) =>
     if (now - (lastSent.get(key) ?? 0) < 5_000) return
     lastSent.set(key, now)
 
-    const base = await tunnelUrl
+    const base = await tunnelUrl()
     const link = base ? `${base}/${base64UrlEncode(info.directory)}/session/${sessionID}` : undefined
 
     const body: Record<string, unknown> = {

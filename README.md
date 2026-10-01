@@ -92,6 +92,19 @@ Example `~/.config/opencode/remote-notify.json`:
 
 Notifications for the same session and event within 5 seconds are de-duplicated.
 
+## Automatic tunnel recovery
+
+The plugin watches the tunnel and restarts `cloudflared` when:
+
+- `cloudflared` exits or doesn't come up within 60s (retries back off from 2s up to 60s);
+- the machine's network addresses change, such as switching Wi-Fi or connecting a VPN;
+- the process was suspended, such as when the laptop sleeps;
+- the public URL fails 3 health checks in a row (checked every 20s).
+
+Quick-tunnel URLs change on every restart. When that happens, the plugin sends an **"opencode tunnel reconnected"** notification with the new URL, and later notifications link to it.
+
+You can also restart the tunnel by hand by asking the agent to run the `tunnel_restart` tool.
+
 ## Restarting the tunnel without restarting opencode
 
 Send `SIGUSR1` to the opencode server:
